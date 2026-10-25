@@ -10,11 +10,16 @@ PanelWindow {
   id: overlay
 
   property var stage: null
+  // The screen this overlay belongs to. active compares against this, not
+  // the window's own screen: showing the window re-sends screen's change
+  // signal while active is being worked out, which QML reports as a loop.
+  property var stageScreen: null
+  screen: stageScreen
 
-  readonly property bool active: !!stage && !!stage.dragToplevel && stage.dragScreen === screen
+  readonly property bool active: !!stage && !!stage.dragToplevel && stage.dragScreen === stageScreen
   // Reserved by both side columns, so this surface covers exactly the middle
   // and starts at the left column's edge, level with both columns.
-  readonly property int columnWidth: Math.round((screen ? screen.width : 1920) * (stage ? stage.columnWidth : 0.16))
+  readonly property int columnWidth: Math.round((stageScreen ? stageScreen.width : 1920) * (stage ? stage.columnWidth : 0.16))
 
   visible: active
   color: "transparent"
@@ -36,18 +41,19 @@ PanelWindow {
   Rectangle {
     anchors.fill: parent
     anchors.margins: stage ? stage.gap : 10
-    color: overlay.active && stage.dragOverCenter ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12) : "transparent"
+    color: overlay.active && stage.dragTarget === "center" ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12) : "transparent"
     radius: stage ? stage.cornerRadius : 0
     border.width: Style.hoverBorderWidth + 1
-    border.color: overlay.active && stage.dragOverCenter ? Color.accent : Color.muted
+    border.color: overlay.active && stage.dragTarget === "center" ? Color.accent : Color.muted
 
     Behavior on color { ColorAnimation { duration: 120 } }
   }
 
-  // The dragged preview, moved from column coordinates into this surface's.
+  // The dragged preview, moved from screen coordinates into this surface's,
+  // which start past the left column.
   Rectangle {
     visible: overlay.active
-    x: !overlay.active ? 0 : stage.dragSide === "left" ? stage.dragRect.x - overlay.columnWidth : stage.dragRect.x + overlay.width
+    x: overlay.active ? stage.dragRect.x - overlay.columnWidth : 0
     y: overlay.active ? stage.dragRect.y : 0
     width: overlay.active ? stage.dragRect.width : 0
     height: overlay.active ? stage.dragRect.height : 0

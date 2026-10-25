@@ -12,10 +12,13 @@ A stage-manager layout for [Omarchy](https://omarchy.org/). One window sits in t
 
 ## Features
 
-- **Live previews** that keep the window's aspect ratio, stacked from the top and alternating left and right.
-- **Click** a preview to bring that window to the center. It grows out of its preview while the old center window shrinks back into it.
+- **Live previews** that keep the window's aspect ratio, stacked from the top. New ones go to the shorter column.
+- **Click** a preview to bring that window to the center. It grows out of its preview while the old center window shrinks back into it and takes its place in the column.
+- **Click as fast as you like.** Swaps queue up instead of tripping over each other, and a swap cuts its animation short when another is waiting. The animation follows Hyprland's own window animation speed, and with animations off a swap is instant.
 - **Drag** a preview onto the middle of the screen to bring it to the center from where you drop it.
-- **Right-click** a preview to close that window. Apps with unsaved work can still ask first.
+- **Drag** a preview onto the other column to move it there, or up and down its own column to reorder. A line shows where it will land, the other previews slide aside, and each keeps its place until its window closes or comes to the center, even across shell restarts.
+- **Super + ]** and **Super + [** bring the next or previous preview to the center, growing out of its preview. Pressing again steps on through every window.
+- **Middle- or right-click** a preview to close that window. Apps with unsaved work can still ask first.
 - **New windows** open in the center, and the previous center window becomes a preview.
 - **A lone window takes the full width.** The side columns appear once a second window opens.
 - **Lots of windows:** previews keep their size and the columns scroll with the mouse wheel.
@@ -50,6 +53,8 @@ To update, run `git pull && ./install.sh`.
 
 Press **Super + L** to cycle the current workspace through **tiling → stage → scrolling → floating**. **Super + Alt + L** goes the other way.
 
+On a staged workspace, **Super + ]** and **Super + [** step through the previews.
+
 ## Settings
 
 The plugin's entry in `~/.config/omarchy/shell.json` holds these settings. Changes apply when you save the file.
@@ -66,7 +71,7 @@ The plugin's entry in `~/.config/omarchy/shell.json` holds these settings. Chang
 - A staged workspace keeps one tiled window. The others are parked on a hidden special workspace, `special:stage-<n>`, by `hypr-stage-sync`.
 - `hypr-stage-sync` runs after every window open, close or move on a staged workspace.
 - The shell plugin reserves the side columns and draws the parked windows with Quickshell's `ScreencopyView`.
-- Which workspaces are staged is kept as marker files in `~/.local/state/omarchy/stage/`.
+- Which workspaces are staged is kept as marker files in `~/.local/state/omarchy/stage/`, and which column each preview sits in, in `placement.json` there.
 
 ## Known limitations
 

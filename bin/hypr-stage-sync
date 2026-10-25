@@ -8,31 +8,79 @@
 
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/stage"
 
-dispatch() { hyprctl dispatch "$1" >/dev/null; }
-move() { dispatch "hl.dsp.window.move({ workspace = \"$2\", follow = false, window = \"address:$1\" })"; }
+# Dispatches are queued and sent in one hyprctl call by flush: one process and
+# one round trip per step instead of one per dispatch.
+batch=()
+queue() { batch+=("dispatch $1"); }
+flush() {
+  (( ${#batch[@]} )) || return 0
+  local IFS=';'
+  hyprctl --batch "${batch[*]}" >/dev/null
+  batch=()
+}
 
-win() { dispatch "hl.dsp.window.$1({ $2, window = \"address:$3\" })"; }
+move() { queue "hl.dsp.window.move({ workspace = \"$2\", follow = false, window = \"address:$1\" })"; }
+win() { queue "hl.dsp.window.$1({ $2, window = \"address:$3\" })"; }
 no_anim() { win set_prop "prop = \"no_anim\", value = \"$1\"" "$2"; }
+focus() { queue "hl.dsp.focus({ window = \"address:$1\" })"; }
 # place ADDR X Y W H
 place() { win resize "x = $4, y = $5" "$1"; win move "x = $2, y = $3" "$1"; }
 
-# The sync must not touch a workspace mid-swap: with both windows floating it
-# would see no primary and bring one back.
-BUSY="$STATE/.busy"
-if [[ $1 != promote && -e $BUSY ]] && (( $(date +%s) - $(stat -c %Y "$BUSY") < 5 )); then
-  exit 0
+# How long Hyprland animates a window moving or resizing, in seconds: the
+# windowsMove animation, or the nearest parent the config sets. Speed is in
+# tenths of a second. 0 with animations off.
+move_duration() {
+  hyprctl -j --batch "getoption animations:enabled ; animations" | jq -rs '
+    (.[0].bool // (.[0].int == 1)) as $on
+    | ([.[1][0][] | {(.name): .}] | add) as $all
+    | (["windowsMove", "windows", "global"] | map($all[.] | select(. != null and .overridden)) | first) as $anim
+    | if $on and $anim != null and $anim.enabled then $anim.speed / 10 else 0 end'
+}
+
+# Waits up to $1 seconds, but stops early once another promote is waiting its
+# turn: that one swaps the windows again, so this animation need not finish.
+wait_unless_queued() {
+  local steps i
+  steps=$(awk -v s="$1" 'BEGIN { print int(s * 50 + 0.5) }')
+  for (( i = 0; i < steps; i++ )); do
+    compgen -G "$STATE/.queued.*" >/dev/null && return
+    sleep 0.02
+  done
+}
+
+# One run at a time, so nothing touches a workspace mid-swap: with both
+# windows floating a tidy would see no primary and bring one back. Promotes
+# queue up (clicks faster than a swap wait their turn, and each marks itself
+# waiting so the one running cuts its animation short); a tidy gives up after
+# 5 seconds, since the promote ahead of it tidies when done.
+mkdir -p "$STATE"
+exec 9>"$STATE/.lock"
+if [[ $1 == promote ]]; then
+  queued="$STATE/.queued.$$"
+  trap 'rm -f "$queued"' EXIT
+  touch "$queued"
+  flock 9
+  rm -f "$queued"
+else
+  flock -w 5 9 || exit 0
 fi
 
 if [[ $1 == promote && -n $2 ]]; then
   addr=$2
   clients=$(hyprctl clients -j) || exit 1
-  ws=$(jq -r --arg a "$addr" '.[] | select(.address == $a) | .workspace.name' <<<"$clients")
-  [[ $ws == special:stage-* ]] || exit 0
-  ws=${ws#special:stage-}
-  primary=$(jq -r --arg ws "$ws" '[.[] | select(.workspace.name == $ws and (.floating | not) and (.hidden | not))] | sort_by(.focusHistoryID) | .[0].address // empty' <<<"$clients")
+  # The window's workspace and the primary it replaces, in one jq run.
+  read -r ws primary < <(jq -r --arg a "$addr" '
+    (.[] | select(.address == $a) | .workspace.name) as $name
+    | ($name | ltrimstr("special:stage-")) as $ws
+    | select($name | startswith("special:stage-"))
+    | [.[] | select(.workspace.name == $ws and (.floating | not) and (.hidden | not))]
+    | sort_by(.focusHistoryID) | "\($ws) \(.[0].address // "")"' <<<"$clients")
+  [[ -n $ws ]] || exit 0
 
   # The preview's place on screen: its side column's origin plus its offset.
-  if [[ $# -ge 7 ]]; then
+  # With animations off there is nothing to grow, so it just moves in.
+  anim=$(move_duration)
+  if [[ $# -ge 7 && $anim != 0 ]]; then
     side=$3 w=${6%.*} h=${7%.*}
     monitor=$(hyprctl workspaces -j | jq -r --argjson id "$ws" '.[] | select(.id == $id) | .monitor')
     read -r ox oy < <(hyprctl layers -j | jq -r --arg m "$monitor" --arg side "$side" '
@@ -43,10 +91,9 @@ if [[ $1 == promote && -n $2 ]]; then
 
   if [[ -z $x ]]; then
     move "$addr" "$ws"
-    dispatch "hl.dsp.focus({ window = \"address:$addr\" })"
+    focus "$addr"
+    flush
   else
-    mkdir -p "$STATE" && touch "$BUSY"
-
     # The old primary floats and shrinks into the preview's place.
     if [[ -n $primary ]]; then
       win float 'action = "on"' "$primary"
@@ -61,42 +108,49 @@ if [[ $1 == promote && -n $2 ]]; then
     place "$addr" "$x" "$y" "$w" "$h"
     move "$addr" "$ws"
     place "$addr" "$x" "$y" "$w" "$h"
+    flush
     sleep 0.05
     no_anim unset "$addr"
     win float 'action = "off"' "$addr"
-    dispatch "hl.dsp.focus({ window = \"address:$addr\" })"
+    focus "$addr"
+    flush
 
     # Once the old primary has shrunk away, it is parked and tiled again.
     if [[ -n $primary ]]; then
-      sleep 0.35
+      wait_unless_queued "$anim"
       no_anim 1 "$primary"
       move "$primary" "special:stage-$ws"
       win float 'action = "off"' "$primary"
       no_anim unset "$primary"
+      flush
     fi
-
-    rm -f "$BUSY"
   fi
 fi
 
-clients=$(hyprctl clients -j) || exit 1
 staged=$(ls "$STATE" 2>/dev/null | grep -E '^[0-9]+$')
+# Nothing staged and nothing parked: no need to ask Hyprland anything.
+[[ -n $staged ]] || hyprctl workspaces -j | grep -q '"special:stage-' || exit 0
+clients=$(hyprctl clients -j) || exit 1
 
-# Parked windows of a workspace that is no longer staged go back to it.
+# Every move the tidy needs, as "ADDR WORKSPACE" lines, from one jq run:
+# - parked windows of a workspace that is no longer staged go back to it;
+# - on a staged workspace the most recently focused tiled window stays and the
+#   other tiled ones are parked; hidden windows (a terminal swallowed by an app
+#   it launched) are left alone;
+# - a staged workspace with no tiled window (the primary closed) gets back its
+#   most recently used parked window.
 while read -r addr ws; do
-  [[ -n $addr ]] || continue
-  grep -qx -- "$ws" <<<"$staged" || move "$addr" "$ws"
-done < <(jq -r '.[] | select(.workspace.name | startswith("special:stage-")) | "\(.address) \(.workspace.name | ltrimstr("special:stage-"))"' <<<"$clients")
-
-for ws in $staged; do
-  # The most recently focused tiled window stays; the others are parked.
-  # Hidden windows (a terminal swallowed by an app it launched) are left alone.
-  tiled=$(jq -r --arg ws "$ws" '[.[] | select(.workspace.name == $ws and (.floating | not) and (.hidden | not))] | sort_by(.focusHistoryID) | .[].address' <<<"$clients")
-  if [[ -n $tiled ]]; then
-    tail -n +2 <<<"$tiled" | while read -r addr; do move "$addr" "special:stage-$ws"; done
-  else
-    # The primary closed: bring back the most recently used parked window.
-    next=$(jq -r --arg ws "special:stage-$ws" '[.[] | select(.workspace.name == $ws and (.hidden | not))] | sort_by(.focusHistoryID) | .[0].address // empty' <<<"$clients")
-    [[ -n $next ]] && move "$next" "$ws"
-  fi
-done
+  [[ -n $addr ]] && move "$addr" "$ws"
+done < <(jq -r --arg staged "$staged" '
+  . as $all
+  | ($staged | split("\n") | map(select(length > 0))) as $st
+  | (.[] | select(.workspace.name | startswith("special:stage-"))
+      | (.workspace.name | ltrimstr("special:stage-")) as $ws
+      | select(any($st[]; . == $ws) | not) | "\(.address) \($ws)"),
+    ($st[] as $ws
+      | [$all[] | select(.workspace.name == $ws and (.floating | not) and (.hidden | not))] | sort_by(.focusHistoryID)
+      | if length > 0 then .[1:][] | "\(.address) special:stage-\($ws)"
+        else [$all[] | select(.workspace.name == "special:stage-\($ws)" and (.hidden | not))] | sort_by(.focusHistoryID)
+          | (.[0] // empty) | "\(.address) \($ws)"
+        end)' <<<"$clients")
+flush

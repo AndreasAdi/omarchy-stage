@@ -38,12 +38,44 @@ PanelWindow {
     onTriggered: window.shown = window.hasParked
   }
 
-  // Parked windows alternate sides: first left, second right, and so on.
-  readonly property var windows: {
-    if (!shown) return []
-    var all = stage.parked(workspaceId)
-    var offset = side === "left" ? 0 : 1
-    return all.filter(function(toplevel, index) { return index % 2 === offset })
+  // The addresses of the windows this column shows, from the stage's
+  // placement. The cards follow them in a ListModel, changed in place, so a
+  // card outlives a reorder and slides to its new place, and the others keep
+  // capturing instead of starting over.
+  readonly property var windows: shown ? stage.column(workspaceId, side) : []
+  onWindowsChanged: syncCards()
+
+  ListModel { id: cardModel }
+
+  function syncCards() {
+    for (var i = 0; i < windows.length; i++) {
+      if (i < cardModel.count && cardModel.get(i).address === windows[i]) continue
+      var from = -1
+      for (var j = i + 1; j < cardModel.count; j++) {
+        if (cardModel.get(j).address === windows[i]) { from = j; break }
+      }
+      if (from !== -1) cardModel.move(from, i, 1)
+      else cardModel.insert(i, { address: windows[i] })
+    }
+    if (cardModel.count > windows.length) cardModel.remove(windows.length, cardModel.count - windows.length)
+  }
+
+  // The rectangle of a window's preview in this column, for a promote from
+  // the keyboard to grow out of.
+  function rectOf(address) {
+    for (var i = 0; i < repeater.count; i++) {
+      var item = repeater.itemAt(i)
+      if (item && item.address === address) return item.frameRect()
+    }
+    return null
+  }
+
+  Component.onCompleted: {
+    syncCards()
+    if (stage) stage.columns = stage.columns.concat([window])
+  }
+  Component.onDestruction: {
+    if (stage) stage.columns = stage.columns.filter(function(column) { return column !== window })
   }
 
   visible: shown
@@ -61,6 +93,10 @@ PanelWindow {
   }
 
   implicitWidth: Math.round((screen ? screen.width : 1920) * (stage ? stage.columnWidth : 0.16))
+  // Where this column starts on its screen: drag geometry is kept relative to
+  // the screen so that every surface on it can draw the dragged preview.
+  readonly property real screenWidth: screen ? screen.width : 1920
+  readonly property real originX: side === "left" ? 0 : screenWidth - width
 
   // Many parked windows: the previews may shrink toward minPreviewSize (1 by
   // default, so they keep their size), titles go once they get small, and the
@@ -96,13 +132,38 @@ PanelWindow {
     font.pixelSize: Style.font.body
   }
 
-  // The dragged preview while it is still over this column.
-  readonly property bool dragFromHere: !!stage && !!stage.dragToplevel && stage.dragScreen === screen && stage.dragSide === side
+  // A preview is being dragged on this screen, and whether it would drop into
+  // this column and before which of its previews.
+  readonly property bool dragging: !!stage && !!stage.dragToplevel && stage.dragScreen === screen
+  readonly property bool dropHere: dragging && stage.dragTarget === side
+  readonly property int dropIndex: dropHere ? indexAt(stage.dragRect.y + stage.dragRect.height / 2) : -1
+  onDropIndexChanged: if (dropHere) stage.dropIndex = dropIndex
+
+  // The place in this column for a preview dropped with its middle at y.
+  function indexAt(y) {
+    var contentY = y + flick.contentY - cards.y
+    for (var i = 0; i < repeater.count; i++) {
+      var item = repeater.itemAt(i)
+      if (item && contentY < item.y + item.height / 2) return i
+    }
+    return repeater.count
+  }
+
+  // The dragged preview while any of it is over this column.
+  readonly property bool ghostHere: dragging && stage.dragRect.x + stage.dragRect.width > originX
+                                    && stage.dragRect.x < originX + width
+
+  // The column a preview would drop into is tinted.
+  Rectangle {
+    anchors.fill: parent
+    visible: window.dropHere && stage.dragSide !== window.side
+    color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12)
+  }
 
   Rectangle {
     z: 10
-    visible: window.dragFromHere
-    x: stage ? stage.dragRect.x : 0
+    visible: window.ghostHere
+    x: stage ? stage.dragRect.x - window.originX : 0
     y: stage ? stage.dragRect.y : 0
     width: stage ? stage.dragRect.width : 0
     height: stage ? stage.dragRect.height : 0
@@ -115,17 +176,33 @@ PanelWindow {
     ScreencopyView {
       anchors.fill: parent
       anchors.margins: parent.border.width
-      captureSource: window.dragFromHere ? stage.dragToplevel.wayland : null
-      live: window.dragFromHere
+      captureSource: window.ghostHere ? stage.dragToplevel.wayland : null
+      live: window.ghostHere
     }
   }
 
   Flickable {
+    id: flick
     anchors.fill: parent
     interactive: contentHeight > height
     contentHeight: cards.implicitHeight + window.pad * 2
     boundsBehavior: Flickable.StopAtBounds
     clip: true
+
+    // Where a dropped preview would land: a line in the gap above the preview
+    // at dropIndex, or below the last one.
+    Rectangle {
+      readonly property var before: window.dropHere ? repeater.itemAt(window.dropIndex) : null
+      readonly property var last: window.dropHere && repeater.count > 0 ? repeater.itemAt(repeater.count - 1) : null
+      visible: window.dropHere
+      z: 5
+      x: cards.x
+      width: cards.width
+      height: 3
+      radius: 1.5
+      color: Color.accent
+      y: cards.y - height / 2 + (before ? before.y - window.pad / 2 : last ? last.y + last.height + window.pad / 2 : 0)
+    }
 
     Column {
       id: cards
@@ -134,15 +211,35 @@ PanelWindow {
       width: window.cardWidth
       spacing: window.pad
 
+      // Previews slide to their new place when one is moved, added or closed.
+      move: Transition {
+        NumberAnimation { properties: "x,y"; duration: 200; easing.type: Easing.OutCubic }
+      }
+
       Repeater {
-        model: window.windows
+        id: repeater
+        model: cardModel
 
         delegate: Item {
           id: card
-          required property var modelData
+          required property string address
+          readonly property var toplevel: window.stage ? window.stage.parkedByAddress[address] || null : null
 
           width: parent.width
           height: frame.height + (title.visible ? window.titleHeight : 0)
+
+          // A new preview fades in where it lands.
+          NumberAnimation on opacity { from: 0; to: 1; duration: 180; easing.type: Easing.OutCubic }
+
+          function frameRect() {
+            var origin = frame.mapToItem(window.contentItem, 0, 0)
+            return Qt.rect(origin.x, origin.y, frame.width, frame.height)
+          }
+
+          // Only a preview in view keeps capturing; one scrolled out of the
+          // column, or faded out while it is dragged, keeps its last frame.
+          readonly property bool inView: cards.y + y + height > flick.contentY
+                                         && cards.y + y < flick.contentY + flick.height
 
           Rectangle {
             id: frame
@@ -160,8 +257,8 @@ PanelWindow {
               id: preview
               anchors.fill: parent
               anchors.margins: frame.border.width
-              captureSource: card.modelData.wayland
-              live: true
+              captureSource: card.toplevel ? card.toplevel.wayland : null
+              live: card.inView && !mouse.dragging
             }
           }
 
@@ -171,7 +268,7 @@ PanelWindow {
             anchors.top: frame.bottom
             anchors.topMargin: Style.spacing.xs
             width: parent.width
-            text: card.modelData.title || (card.modelData.wayland ? card.modelData.wayland.appId : "")
+            text: !card.toplevel ? "" : card.toplevel.title || (card.toplevel.wayland ? card.toplevel.wayland.appId : "")
             elide: Text.ElideRight
             horizontalAlignment: Text.AlignHCenter
             color: mouse.containsMouse ? Color.accent : Color.foreground
@@ -179,60 +276,77 @@ PanelWindow {
             font.pixelSize: Style.font.body
           }
 
-          // Right-click closes the window. Click to promote, or drag onto the
-          // middle of the screen: past a few
-          // pixels the press becomes a drag. The pointer stays with this
-          // surface while the button is held, so its position keeps arriving
-          // even over the middle, where the drop overlay draws the preview.
+          // Middle- or right-click closes the window. Click to promote, or drag: onto the
+          // middle of the screen to promote, onto the other column to move it
+          // there, or up and down this one to reorder. Past a few pixels the
+          // press becomes a drag. The pointer stays with this surface while
+          // the button is held, so its position keeps arriving even over the
+          // middle and the other column, which draw the preview there.
           MouseArea {
             id: mouse
             anchors.fill: parent
             hoverEnabled: true
-            acceptedButtons: Qt.LeftButton | Qt.RightButton
+            acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
             // Dragging a card moves the card, never scrolls the column.
             preventStealing: true
             cursorShape: dragging ? Qt.ClosedHandCursor : Qt.PointingHandCursor
 
             property point pressPoint
             property bool dragging: false
+            // Qt still sends clicked after a drag let go over a card; this
+            // keeps that click from promoting the window.
+            property bool dropped: false
 
+            // The dragged preview's rectangle, relative to the screen.
             function ghostRect(m) {
               var origin = card.mapToItem(window.contentItem, m.x - pressPoint.x, m.y - pressPoint.y)
-              return Qt.rect(origin.x, origin.y, frame.width, frame.height)
+              return Qt.rect(origin.x + window.originX, origin.y, frame.width, frame.height)
             }
 
-            function overCenter(m) {
-              var point = card.mapToItem(window.contentItem, m.x, m.y)
-              return window.side === "left" ? point.x > window.width : point.x < 0
+            // Where the pointer would drop the preview: a column or the middle.
+            function zoneAt(m) {
+              var x = card.mapToItem(window.contentItem, m.x, m.y).x + window.originX
+              return x < window.width ? "left" : x >= window.screenWidth - window.width ? "right" : "center"
             }
 
             onPressed: function(m) {
               if (m.button !== Qt.LeftButton) return
               pressPoint = Qt.point(m.x, m.y)
               dragging = false
+              dropped = false
             }
 
             onPositionChanged: function(m) {
-              if (!(pressedButtons & Qt.LeftButton) || !window.stage) return
+              if (!(pressedButtons & Qt.LeftButton) || !window.stage || !card.toplevel) return
               if (!dragging && Math.abs(m.x - pressPoint.x) + Math.abs(m.y - pressPoint.y) > 8) {
                 dragging = true
-                window.stage.dragToplevel = card.modelData
+                window.stage.dragToplevel = card.toplevel
                 window.stage.dragScreen = window.screen
                 window.stage.dragSide = window.side
               }
               if (!dragging) return
               window.stage.dragRect = ghostRect(m)
-              window.stage.dragOverCenter = overCenter(m)
+              window.stage.dragTarget = zoneAt(m)
             }
 
             onReleased: function(m) {
               if (!dragging || !window.stage) return
-              var drop = overCenter(m)
+              var stage = window.stage
+              // The target the drag showed last, which dropIndex belongs to.
+              var target = stage.dragTarget || zoneAt(m)
               var rect = ghostRect(m)
-              window.stage.endDrag()
+              var index = stage.dropIndex
+              stage.endDrag()
               dragging = false
-              // Dropped on the middle: it grows into place from where it was let go.
-              if (drop) window.stage.promote(card.modelData, window.side, rect)
+              dropped = true
+              if (!card.toplevel) return
+              if (target === "center") {
+                // Dropped on the middle: it grows into place from where it was
+                // let go, given in this column's coordinates.
+                stage.promote(card.toplevel, window.side, Qt.rect(rect.x - window.originX, rect.y, rect.width, rect.height))
+              } else {
+                stage.moveTo(card.toplevel, window.workspaceId, target, index)
+              }
             }
 
             onCanceled: {
@@ -241,13 +355,13 @@ PanelWindow {
             }
 
             onClicked: function(m) {
-              if (m.button === Qt.RightButton) {
-                if (card.modelData.wayland) card.modelData.wayland.close()
+              if (!card.toplevel) return
+              if (m.button === Qt.MiddleButton || m.button === Qt.RightButton) {
+                if (card.toplevel.wayland) card.toplevel.wayland.close()
                 return
               }
-              if (!window.stage || dragging) return
-              var origin = frame.mapToItem(window.contentItem, 0, 0)
-              window.stage.promote(card.modelData, window.side, Qt.rect(origin.x, origin.y, frame.width, frame.height))
+              if (!window.stage || dragging || dropped) return
+              window.stage.promote(card.toplevel, window.side, card.frameRect())
             }
           }
         }
