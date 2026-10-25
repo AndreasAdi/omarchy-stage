@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "andreas.stage",
+  "name": "Stage",
+  "version": "1.0.0",
+  "author": "Andreas Adi",
+  "license": "MIT",
+  "description": "Stage mode: one window in the center, the rest as live previews on the sides",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "qml/Stage.qml"
+  }
+}

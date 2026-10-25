@@ -1,0 +1,98 @@
+#!/bin/bash
+# Copy of omarchy-hyprland-workspace-layout-toggle with stage mode added.
+# Cycle: tiling -> stage -> scrolling -> floating -> tiling.
+# Stage is the dwindle layout plus a marker in ~/.local/state/omarchy/stage that
+# hypr-stage-sync and the andreas.stage shell plugin act on.
+
+notify_layout() {
+  local state="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-layout-notification"
+  local last id
+  [[ -r $state ]] && read -r last <"$state"
+  if id=$(omarchy-notification-send -p -r "${last:-0}" -g 󱂬 "$1") && [[ $id =~ ^[0-9]+$ ]]; then
+    mkdir -p "$(dirname "$state")" && printf '%s\n' "$id" >"$state"
+  fi
+}
+
+DIRECTION=${1:-next}
+if [[ $DIRECTION != "next" && $DIRECTION != "back" ]]; then
+  echo "Usage: hypr-workspace-layout-cycle [back]" >&2
+  exit 1
+fi
+
+ACTIVE_WORKSPACE=$(hyprctl activeworkspace -j | jq -r '.id')
+[[ $ACTIVE_WORKSPACE =~ ^[0-9]+$ ]] || exit 1
+MODES_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-layouts"
+MODE_FILE="$MODES_DIR/$ACTIVE_WORKSPACE.lua"
+
+STAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/stage"
+STAGE_FILE="$STAGE_DIR/$ACTIVE_WORKSPACE"
+
+if [[ -f $STAGE_FILE ]]; then
+  CURRENT_MODE=stage
+else
+  CURRENT_MODE=$(omarchy-hyprland-workspace-layout-current)
+fi
+
+if [[ $DIRECTION == "back" ]]; then
+  case "$CURRENT_MODE" in
+    floating) NEW_MODE=scrolling ;;
+    scrolling) NEW_MODE=stage ;;
+    stage) NEW_MODE=dwindle ;;
+    *) NEW_MODE=floating ;;
+  esac
+else
+  case "$CURRENT_MODE" in
+    stage) NEW_MODE=scrolling ;;
+    scrolling) NEW_MODE=floating ;;
+    floating) NEW_MODE=dwindle ;;
+    *) NEW_MODE=stage ;;
+  esac
+fi
+
+# Stage tiles with the dwindle layout underneath, so its one window fills the middle.
+LAYOUT=$NEW_MODE
+[[ $NEW_MODE == stage ]] && LAYOUT=dwindle
+
+APPLY="o.workspace_mode({ workspace = \"$ACTIVE_WORKSPACE\", mode = \"$LAYOUT\" })"
+
+case $NEW_MODE in
+  stage) SET_MESSAGE="Workspace layout set to stage" ;;
+  dwindle) SET_MESSAGE=$(omarchy-i18n layout.workspaceTiling) ;;
+  scrolling) SET_MESSAGE=$(omarchy-i18n layout.workspaceScrolling) ;;
+  *) SET_MESSAGE=$(omarchy-i18n layout.workspaceFloating) ;;
+esac
+
+APPLIED=0
+if hyprctl eval "$APPLY" >/dev/null 2>&1; then
+  APPLIED=1
+fi
+
+if (( ! APPLIED )); then
+  notify_layout "$(omarchy-i18n layout.needsReload)"
+elif [[ $LAYOUT == "$(omarchy-hyprland-workspace-layout-default)" ]]; then
+  # Back on the default: follow it again instead of saving a mode.
+  rm -f "$MODE_FILE"
+  notify_layout "$SET_MESSAGE"
+elif mkdir -p "$MODES_DIR" && printf '%s\n' "$APPLY" >"$MODE_FILE"; then
+  notify_layout "$SET_MESSAGE"
+else
+  notify_layout "$SET_MESSAGE (not saved)"
+fi
+
+if (( APPLIED )); then
+  if [[ $NEW_MODE == stage ]]; then
+    mkdir -p "$STAGE_DIR" && touch "$STAGE_FILE"
+  else
+    rm -f "$STAGE_FILE"
+  fi
+  "$HOME/.local/bin/hypr-stage-sync"
+  omarchy-shell -q andreas.stage refresh
+  omarchy-shell -q omarchy.workspaces refresh
+  omarchy-shell -q omarchy.dock refresh
+fi
+
+# The titlebar plugin only loads with the config, so the first floating
+# workspace of a session needs a reload.
+if (( APPLIED )) && [[ $NEW_MODE == "floating" ]] && ! hyprctl plugin list -j 2>/dev/null | jq -e 'any(.[]?; .name == "hyprbars")' >/dev/null 2>&1; then
+  hyprctl reload >/dev/null
+fi
